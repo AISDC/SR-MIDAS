@@ -1,17 +1,29 @@
 # SR-MIDAS
 ### Super resolution workflow for MIDAS reconstruction
 
+<hr />
 
+## OPTION 1: AUTO-INSTALLATION: RECOMMENDED
 
-## Setting up the SR workflow
+Download only the 'super_res_install.py' file to your local system. In future, it will be automatically included within the 'MIDAS/utils' directory.
+
+Start a terminal within the MIDAS directory (it is critical to work within the MIDAS directory). This is the same directory where MIDAS was cloned.
+
+Run the 'super_res_install.py' file from here as shown below:
+
+'''bash
+python ../../super_res_install.py
+'''
+
+This will automatically install/update the super-resolution workflow.
+
+## ## OPTION 2: MANUAL INSTALLATION: NOT RECOMMENDED
 
 This implementation requires manually copying the files included here into an existing MIDAS installation. The target directory is as below:
 
 ```bash
 MIDAS/FF_HEDM/v7/
 ```
-
-NOTE: In near future, SR workflow will be included automatically with MIDAS github installation.
 
 The data to be copied is as below:
 
