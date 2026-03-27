@@ -1,8 +1,18 @@
 # SR-MIDAS
 
-Super-resolution CNN workflow for MIDAS high-energy X-ray diffraction (HEDM) data.
+Super-resolution workflow for [MIDAS](https://github.com/marinerhemant/MIDAS) Far-Field High-Energy X-ray Diffraction (FF-HEDM) analysis.
 
-SR-MIDAS trains and applies convolutional neural networks to enhance the spatial resolution of diffraction patches extracted from MIDAS `.MIDAS.zip` detector files, enabling more precise peak localization for far-field HEDM analysis.
+SR-MIDAS provides pipelines for - (a) using pre-trained CNN models, and (b) training new super-resolution models - to enhance the spatial resolution of 2D diffraction patches extracted from FF-HEDM datasets. It integrates with the [MIDAS](https://github.com/marinerhemant/MIDAS) FF-HEDM grain reconstruction routine for improved overlapping peak detection and more precise peak localization for FF-HEDM analysis.
+
+---
+
+### Publication
+
+Artcile: [Super-resolution model for overlapping peak detection and improved spatial resolution in high-energy diffraction microscopy](https://doi.org/10.1016/j.matdes.2026.115917)
+
+DOI: https://doi.org/10.1016/j.matdes.2026.115917
+
+Authors: Dishant Beniwal, Jun-Sang Park, Peter Kenesei, Rajkumar Kettimuthu, Antonino Miceli, Hemant Sharma
 
 ---
 
@@ -94,7 +104,7 @@ In `ff_MIDAS.py` file, add following additional arguments to argument paser insi
                         help="(default 8) Super resolution factor. Options: [2, 4, 8]")
 
     parser.add_argument("-SRconfig_path", type=str, required=False, default="auto", 
-                        help="(default 'auto') Full path to the super resolution configuration (.json) file.
+                        help="(default 'auto') Full path to the super resolution configuration (.json) file.\
                         If not provided, the default configuraton built into the SR-MIDAS will be used")
 
     parser.add_argument("-saveSRpatches", type=int, required=False, default=0, 
@@ -144,38 +154,44 @@ def process_layer(.....,
 
     ....
     ....
+    # Process peaks if required
     if provide_input_all == 0:
-        if do_peak_search == 1:
-            logger.infor(....)
-            try:
+        if _should_run('peak_search'):
+            if do_peak_search == 1:
                 ...
-            except ..:
-                raise ...
-        
-        # Add the modification route for SR-MIDAS workflow --------------------------
+                try:
+                    ...
+                except Exception as e:
+                    raise ...
 
-        elif (do_peak_search == 0) and (runSR == 1):
+            # Add the modification route for SR-MIDAS workflow --------------------------
+            elif (do_peak_search == 0) and (runSR == 1):
 
-            logger.info(f"Running super resolution. Time till now: {time.time() - t0}")
-            from sr_midas.pipeline.sr_process import run_sr_process
+                logger.info(f"Running super resolution. Time till now: {time.time() - t0}")
+                from sr_midas.pipeline.sr_process import run_sr_process
+                
+                sr_process_args = {}
+                sr_process_args['midasZarrDir'] = result_dir
+                sr_process_args['srfac'] = srfac
+
+                if SRconfig_path != 'auto':
+                    # 'SRconfig_path' variable will be passed only if it is not the default value
+                    sr_process_args['SRconfig_path'] = SRconfig_path 
+
+                sr_process_args['saveSRpatches'] = saveSRpatches
+                sr_process_args['saveFrameGoodCoords'] = saveFrameGoodCoords
+
+                try:
+                    run_sr_process(**sr_process_args)
+                    ph5.mark('peak_search')
+                except Exception as e:
+                    logger.error(f"Failed to execute SR-MIDAS workflow: {e}")
+                    return None
+            # --------------------------
             
-            sr_process_args = {}
-            sr_process_args['midasZarrDir'] = result_dir
-            sr_process_args['srfac'] = srfac
+            else:
+                ...
 
-            if SRconfig_path != 'auto':
-                # 'SRconfig_path' variable will be passed only if it is not the default value
-                sr_process_args['SRconfig_path'] = SRconfig_path 
-
-            sr_process_args['saveSRpatches'] = saveSRpatches
-            sr_process_args['saveFrameGoodCoords'] = saveFrameGoodCoords
-
-            try:
-                run_sr_process(**sr_process_args)
-            except Exception as e:
-                logger.error(f"Failed to execute SR-MIDAS workflow: {e}")
-                return None
-        # --------------------------
 ```
 
 ## Running MIDAS FF-HEDM analysis with super-resolution workflow enabled
