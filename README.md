@@ -80,7 +80,7 @@ sr-midas-process              # apply trained model to full MIDAS data
 ## Adding SR-MIDAS worflow to MIDAS FF-HEDM workflow
 NOTE: This requires modification of ff_MIDAS.py file and should be carried out very carefully.
 
-Add following additional arguments to argument paser in ff_MIDAS.py:
+In `ff_MIDAS.py` file, add following additional arguments to argument paser inside the `main()` function:
 
 ```Python
     # Adding additional arguments for SR-MIDAS workflow --------------------------
@@ -118,7 +118,7 @@ Create following additional variables from arguments:
 
 ```
 
-For both the batch mode and standard mode, when calling process_layer(....) function, pass following additional variables:
+Within the `main()` function, pass following additional variables when calling `process_layer(....)` for both the batch mode and standard mode:
 
 ```Python
     try:
@@ -131,7 +131,9 @@ For both the batch mode and standard mode, when calling process_layer(....) func
         )
 ```
 
-The last step is to modify the process_layer() function itself to create a route for super-resolution workflow. First, modify the function definition to include the additional variables and then modify the peak search section to include an additional pathway:
+The last step is to modify the `process_layer()` function to create a route for super-resolution workflow.
+- modify the function definition to include the additional variables
+- modify the peak search section to include an additional pathway
 
 ```Python
 def process_layer(.....,
@@ -177,8 +179,8 @@ def process_layer(.....,
 ## Running MIDAS FF-HEDM analysis with super-resolution workflow enabled
 
 If your MIDAS installation is compatible with running SR-MIDAS, the super-resolution workflow can be enabled by declaring two additional arguments in the command line for MIDAS FF-HEDM analysis.
-- doPeakSearch 0 : This disables the MIDAS peak fitting.
-- runSR 1 : This triggers the SR workflow and hands over the peak fitting task to SR-MIDAS pipeline 
+`- doPeakSearch 0` : This disables the MIDAS peak fitting.
+`- runSR 1` : This triggers the SR workflow and hands over the peak fitting task to SR-MIDAS pipeline 
 
 ```bash
 python ../MIDAS/FF-HEDM/workflows/ff_MIDAS.py \
