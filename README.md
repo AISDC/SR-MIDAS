@@ -4,6 +4,8 @@ Super-resolution workflow for [MIDAS](https://github.com/marinerhemant/MIDAS) Fa
 
 SR-MIDAS provides pipelines for - (a) using pre-trained CNN models, and (b) training new super-resolution models - to enhance the spatial resolution of 2D diffraction patches extracted from FF-HEDM datasets. It integrates with the [MIDAS](https://github.com/marinerhemant/MIDAS) FF-HEDM grain reconstruction routine for improved overlapping peak detection and more precise peak localization for FF-HEDM analysis.
 
+**v0.1.2** — GPU-accelerated peak fitting is now available, providing ~1000x speedup over the CPU path by using batched pseudo-Voigt fitting with PyTorch on CUDA GPUs. GPU fitting is enabled by default and falls back to CPU automatically when no CUDA device is available.
+
 ---
 
 ### Publication
@@ -34,6 +36,7 @@ Authors: Dishant Beniwal, Jun-Sang Park, Peter Kenesei, Rajkumar Kettimuthu, Ant
 - [Pretrained Models](#pretrained-models)
 - [SR Config File](#sr-config-file)
 - [Architecture String Format](#architecture-string-format)
+- [GPU Peak Fitting](#gpu-peak-fitting)
 
 ---
 
@@ -220,6 +223,7 @@ The above command will SR worflow with default in-built configuration in SR-MIDA
 | `-SRconfig_path` | Path to .json configuration file for super-resolution workflow | "auto" | Full path to .json SR configuration file |
 | `-saveSRpatches` | Controls if predicted SR patches are saved (if =1) | 0 | {0, 1} |
 | `-saveFrameGoodCoords` | Controls if GoodCoords map is saved for each frame (if =1) | 0 | {0, 1} |
+| `-use_gpu` | Controls if GPU-accelerated peak fitting is used (if =1, requires CUDA) | 1 | {0, 1} |
 
 Note: Enable 'saveSRpatches' and 'saveFrameGoodCoords' only if you want to debug the SR workflow since these will take significant disk space.
 
@@ -249,6 +253,7 @@ sr-midas-process \
 | `-SRconfig` | bundled `cnnsr_sr_config.json` | Path to SR config `.json` or `.txt` file |
 | `-saveSRpatches` | `1` | Save SR patch arrays to disk (`1`=yes, `0`=no) |
 | `-saveFrameGoodCoords` | `1` | Save per-frame coordinate maps (`1`=yes, `0`=no) |
+| `-use_gpu` | `1` | Use GPU-accelerated peak fitting when CUDA is available (`1`=yes, `0`=no) |
 
 When `-SRconfig` is not provided, the bundled `cnnsr_sr_config.json` is used automatically, which points to the pretrained cascaded models included in the package.
 
@@ -505,6 +510,14 @@ Key functions are importable directly from the `sr_midas` package:
 ```python
 import torch
 import sr_midas
+from sr_midas.pipeline.sr_process import run_sr_process
+
+# Run the full SR pipeline (GPU peak fitting enabled by default)
+run_sr_process(
+    midasZarrDir="/path/to/analysis_dir/",
+    srfac=8,
+    use_gpu=1,   # set to 0 to force CPU-only peak fitting
+)
 
 # Load a trained CNNSR model
 mod, mod_args, channels = sr_midas.load_trained_CNNSR(
@@ -630,3 +643,44 @@ All convolutions use same-padding, so spatial dimensions are preserved throughou
 | `"64-5-r_32-5-r_1-5-s"` | 3 layers | Standard SRCNN-style architecture |
 | `"64-3-r_64-3-r_32-3-r_1-3-s"` | 4 layers | Deeper network with smaller receptive field |
 | `"8-3-r_1-3-s"` | 2 layers | Minimal network for testing |
+
+---
+
+## GPU Peak Fitting
+
+*Added in v0.1.2*
+
+SR-MIDAS includes GPU-accelerated 2D pseudo-Voigt peak fitting as an alternative to the per-patch `scipy.curve_fit` (TRF) CPU path. When enabled, all patches in a detector frame are fitted simultaneously on the GPU using a batched Adam optimizer with `torch.compile` JIT compilation.
+
+### How it works
+
+1. **GPU peak detection** — peaks are detected using a fully vectorized max-pooling approach with plateau suppression (equivalent to `skimage.feature.peak_local_max`)
+2. **Batched pseudo-Voigt fitting** — a differentiable 2D pseudo-Voigt model is evaluated for all patches in parallel, with parameter bounds enforced via sigmoid projection
+3. **torch.compile acceleration** — the fitting kernel is JIT-compiled on first use (one-time warmup cost), providing significant speedup for subsequent frames
+
+### Usage
+
+GPU peak fitting is **enabled by default** (`use_gpu=1`). No additional configuration is required — it uses the same `peak_find_args` parameters from the SR config file.
+
+**Behavior:**
+- If `use_gpu=1` and a CUDA GPU is available → GPU peak fitting is used
+- If `use_gpu=0` → CPU peak fitting is used (original `scipy.curve_fit` path)
+- If no CUDA GPU is available → falls back to CPU with a warning
+
+To disable GPU fitting explicitly:
+
+```bash
+sr-midas-process -midasZarrDir /path/to/analysis_dir/ -use_gpu 0
+```
+
+Or in Python:
+
+```python
+from sr_midas.pipeline.sr_process import run_sr_process
+run_sr_process(midasZarrDir="/path/to/analysis_dir/", use_gpu=0)
+```
+
+### Requirements
+
+- PyTorch ≥ 2.4 with CUDA support (no additional dependencies beyond what SR-MIDAS already requires)
+- A CUDA-capable GPU
