@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Super-resolution CNN workflow for MIDAS high-energy X-ray diffraction data"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = "==3.12.4"
 keywords = ["XRD", "HEDM", "super-resolution", "diffraction", "CNN", "MIDAS"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -20,16 +20,34 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "numpy==1.26.0",
+    "numpy==1.26.4",
     "pandas==3.0.2",
     "h5py==3.16.0",
     "zarr==2.18.7",
     "scipy==1.17.1",
-    "scikit-image==0.26.0",
+    "scikit-image==0.25.2",
     "scikit-learn==1.8.0",
     "matplotlib==3.10.8",
     "tqdm==4.67.3",
     "torch==2.9.1",
+    "parsl==2024.9.16",
+    "pillow==12.2.0",
+    "numba==0.59.1",
+    "numcodecs==0.15.1",
+    "hdf5plugin==5.0.0",
+    "dash==2.18.1",
+    "plotly==5.22.0",
+    "dash_bootstrap_components==1.6.0",
+    "diplib==3.5.1",
+    "fsspec==2026.3.0",
+    "opencv-python",
+    "globus_compute_sdk==2.27.1",
+    "globus_sdk==3.63.0",
+    "diskcache",
+    "multiprocess",
+    "pyqtgraph",
+    "PyQt5",
+    "PyQt6==6.9.0",
 ]
 
 [project.optional-dependencies]
