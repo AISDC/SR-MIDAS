@@ -55,22 +55,5 @@
             "SRx1": 60, "SRx2": 20, "SRx4": 15, "SRx8": 10,
             "about": "intensity threshold used for pseudo-Voigt fitting"
         }
-    },
-    "shift_YZ_pos": {
-        "SRx2": {
-            "shiftYpx": -0.25,
-            "shiftZpx": -0.25,
-            "about": "sub-pixel shift corrections in Y and Z for SRx2 peak positions"
-        },
-        "SRx4": {
-            "shiftYpx": -0.375,
-            "shiftZpx": -0.375,
-            "about": "sub-pixel shift corrections in Y and Z for SRx4 peak positions"
-        },
-        "SRx8": {
-            "shiftYpx": -0.4375,
-            "shiftZpx": -0.4375,
-            "about": "sub-pixel shift corrections in Y and Z for SRx8 peak positions"
-        }
     }
 }

@@ -146,15 +146,6 @@ def parse_sr_config_txt(SRconfig_path):
     try: sr_config["peak_find_args"]["pvfit_int_thresh"] = {f"SRx{i}": float(cfg[f"SRx{i}_pvfit_int_thresh"]) for i in [1, 2, 4, 8]}
     except: pass
 
-    sr_config["shift_YZ_pos"] = {}
-    for i in [2, 4, 8]:
-        try:
-            sr_config["shift_YZ_pos"][f"SRx{i}"] = {
-                "shiftYpx": float(cfg[f"SRx{i}_shift_Ypx"]),
-                "shiftZpx": float(cfg[f"SRx{i}_shift_Zpx"])
-            }
-        except: pass
-
     return sr_config
 
 

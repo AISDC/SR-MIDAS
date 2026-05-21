@@ -27,6 +27,7 @@ from copy import deepcopy
 
 from sr_midas.utils.io import (NumpyEncoder, setup_logging, read_hkls_csv,
                                 parse_sr_config_txt, update_nested_dict)
+from sr_midas.physics.coord_transform import pixel_center_shift_for_srfac
 from sr_midas.physics.detector import (create_rotation_matrices, create_distortion_map,
                                         ringNr_map_on_detector)
 from sr_midas.physics.peaks2d import pseudoVoigt2d_diffLGwidth
@@ -334,26 +335,47 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
     t_run += tf - ts
     SRlogger.info(f"{'-'*5} Time to load models: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
-    # ── GPU peak fitting setup ──
-    gpu_peakfit_enabled = False
+    # ── All-GPU pipeline setup ──
+    # When CUDA is available and use_gpu=1, the per-frame loop runs entirely
+    # on device: preprocess, CCL, patch extraction, SR cascade, peak fit.
+    # Otherwise, the existing CPU pipeline is used (no peak fit on GPU).
+    gpu_pipeline_enabled = False
+    gpu_corr = None
+    x2mod_gpu = x2mod
+    x4mod_gpu = x4mod
+    x8mod_gpu = x8mod
     if use_gpu == 1 and torch_devs.type == "cuda":
         try:
             from sr_midas.pipeline._gpu_peakfit import gpu_fit_frame_patches, warmup_gpu_compile
-            gpu_peakfit_enabled = True
-            SRlogger.info(f"GPU peak fitting: ENABLED (CUDA available, use_gpu=1)")
+            from sr_midas.pipeline._gpu_preprocess import (
+                upload_correction_frames, preprocess_frame_gpu, gpu_ccl, extract_patches_gpu)
+            from sr_midas.pipeline._gpu_sr_cascade import cascade_sr_gpu
+            gpu_pipeline_enabled = True
+            SRlogger.info(f"GPU pipeline: ENABLED (CUDA available, use_gpu=1)")
 
             ts = time.time()
+            SRlogger.info(f"\t|Uploading dark/flood/mask/RingNrmap to GPU...")
+            gpu_corr = upload_correction_frames(dark, flood, mask, RingNrmap,
+                                                sr_params["ImTransOpt"], torch_devs)
             SRlogger.info(f"\t|Warming up torch.compile for GPU peak fitting (one-time cost)...")
             warmup_gpu_compile(sr_config, sr_params, srfac, torch_devs)
+            # Compile the three cascade CNNs (mode="default"). Adds ~5-25s
+            # one-time compile on first frame; ~10% steady-state speedup
+            # stacked on top of the extended autocast (sr_autocast_bench V9).
+            # CPU-fallback path still uses the uncompiled x2mod/x4mod/x8mod refs.
+            SRlogger.info(f"\t|torch.compile wrapping the three SR cascade models (default mode)...")
+            x2mod_gpu = torch.compile(x2mod, mode="default")
+            x4mod_gpu = torch.compile(x4mod, mode="default")
+            x8mod_gpu = torch.compile(x8mod, mode="default")
             tf = time.time()
             t_run += tf - ts
-            SRlogger.info(f"{'-'*5} Time to warmup GPU peak fitting: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+            SRlogger.info(f"{'-'*5} Time to upload corrections + warmup GPU peak fitting: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
         except Exception as e:
-            SRlogger.warning(f"GPU peak fitting: DISABLED (import failed: {e}). Falling back to CPU.")
-            gpu_peakfit_enabled = False
+            SRlogger.warning(f"GPU pipeline: DISABLED (import failed: {e}). Falling back to CPU.")
+            gpu_pipeline_enabled = False
     else:
         reason = "use_gpu=0" if use_gpu == 0 else f"no CUDA (device={torch_devs.type})"
-        SRlogger.info(f"GPU peak fitting: DISABLED ({reason}). Using CPU peak fitting.")
+        SRlogger.info(f"GPU pipeline: DISABLED ({reason}). Using CPU pipeline.")
 
     col_names = ["SpotID", "IntegratedIntensity", "Omega(degrees)", "YCen(px)", "ZCen(px)", "IMax",
                  "Radius(px)", "Eta(degrees)", "SigmaR", "SigmaEta", "NrPixels",
@@ -364,9 +386,10 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
 
     nr_frames = exData.shape[0]
 
-    shiftYpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftYpx"]
-    shiftZpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftZpx"]
-    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx}")
+    # Auto-derived from srfac: maps internal SR-grid (leading-edge) coords to
+    # MIDAS pixel-center convention. See physics.coord_transform.
+    shiftYpx = shiftZpx = pixel_center_shift_for_srfac(srfac)
+    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx} (auto from srfac={srfac})")
 
     # Accumulators for consolidated binary output
     all_frame_peak_data = [None] * nr_frames   # for AllPeaks_PS.bin
@@ -395,209 +418,85 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
             SRlogger.info(f"{'*'*5}| Frame {frame_i} skipped (csv exists).")
             continue
 
-        frame_arr = exData[frame_i].astype(np.float64)
-
-        # Apply image transformations in sequence (matching MIDAS applyImageTransformations_d)
-        for opt in sr_params["ImTransOpt"]:
-            if opt == 1:
-                frame_arr = np.flip(frame_arr, axis=1)
-            elif opt == 2:
-                frame_arr = np.flip(frame_arr, axis=0)
-            elif opt == 3:
-                frame_arr = np.transpose(frame_arr)
-
-        # Apply dark/flood/bc corrections (matching MIDAS lines 1430-1440)
-        frame_arr = (frame_arr - dark) / flood
-        frame_arr *= sr_params["bc"]
-
-        # Zero bad pixels
-        if sr_params["BadPxIntensity"] != 0:
-            frame_arr[frame_arr == sr_params["BadPxIntensity"]] = 0
-
-        # Apply mask (zero out masked pixels)
-        frame_arr[mask > 0] = 0
-
-        ts = time.time()
-        frame_goodCoords = np.zeros_like(frame_arr)
-        for ring_i, ring_thresh in enumerate(sr_params["ringsThresh"]):
-            valid_pixels_mask = (RingNrmap == ring_i) & (frame_arr >= ring_thresh)
-            frame_goodCoords[valid_pixels_mask] = frame_arr[valid_pixels_mask]
-
-        if saveFrameGoodCoords == 1:
-            frame_goodCoords_save_dirpath = os.path.join(midasZarrDir, "SR_out", "frame_goodCoords")
-            if not os.path.isdir(frame_goodCoords_save_dirpath):
-                os.mkdir(frame_goodCoords_save_dirpath)
-            frame_goodCoords_savepath = os.path.join(frame_goodCoords_save_dirpath,
-                                                      f"{str(frame_i).zfill(sr_params['padding'])}_GC.npy")
-            np.save(frame_goodCoords_savepath, frame_goodCoords)
-
-        tf = time.time()
-        t_run += tf - ts
-        SRlogger.info(f"{'-'*5} Time to create goodCoords map: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-        ts = time.time()
-        patches_exp, patches_Z00, patches_Y00, nr_pixels_in_patch = \
-            patches_from_detector_frame(frame_goodCoords, sr_config, connectivity_dim=8)
-
-        n_patches = len(patches_exp)
-
-        if n_patches == 0:
-            SRlogger.info(f"\t| No patches found in frame {frame_i}")
-            df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
-            continue
-
-        patches_exp = np.expand_dims(patches_exp, axis=1)
-        patches_Isum = np.sum(patches_exp, axis=(1, 2, 3)).tolist()
-
-        tf = time.time()
-        t_run += tf - ts
-        SRlogger.info(f"\t| Nr. patches in frame {frame_i}: {n_patches}")
-        SRlogger.info(f"{'-'*5} Time to extract patches: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-        # SRx2 model
-        ts = time.time()
-        upscale_fac = 2
-        patches_subset = patches_exp[:, x2mod_ch, :, :]
-        upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
-        upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
-        max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
-        max_vals = np.where(max_vals == 0, 1, max_vals)
-        Xin_x2 = upscaled_patches / max_vals
-        tf = time.time()
-        t_run += tf - ts
-
-        ts = time.time()
-        n_batches = n_patches // sr_config["batch_size"]
-        with torch.no_grad():
-            for i in range(0, n_batches + 1):
-                i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
-                if i_s < n_patches:
-                    X_batch = torch.from_numpy(Xin_x2[i_s:i_f].astype(np.float32)).to(torch_devs)
-                    SRx2_pred_batch = x2mod.forward(X_batch).detach().cpu().numpy()
-                    if i == 0: SRx2_pred = deepcopy(SRx2_pred_batch)
-                    else: SRx2_pred = np.append(SRx2_pred, SRx2_pred_batch, axis=0)
-        tf = time.time()
-        t_run += tf - ts
-        SRlogger.info(f"{'-'*5} Time to predict SRx2: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-        if srfac > 2.5:
+        if gpu_pipeline_enabled:
+            # ── All-GPU per-frame pipeline ────────────────────────────────────
             ts = time.time()
-            upscale_fac = 2
-            patches_subset = SRx2_pred[:, x4mod_ch, :, :]
-            upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
-            upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
-            max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
-            max_vals = np.where(max_vals == 0, 1, max_vals)
-            Xin_x4 = upscaled_patches / max_vals
-            tf = time.time()
-            t_run += tf - ts
+            frame_np = np.array(exData[frame_i])
+            frame_goodCoords_t = preprocess_frame_gpu(frame_np, gpu_corr, sr_params)
+            torch.cuda.synchronize()
+            tf = time.time(); t_run += tf - ts
+            SRlogger.info(f"{'-'*5} Time to create goodCoords map [GPU]: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+
+            if saveFrameGoodCoords == 1:
+                frame_goodCoords_save_dirpath = os.path.join(midasZarrDir, "SR_out", "frame_goodCoords")
+                if not os.path.isdir(frame_goodCoords_save_dirpath):
+                    os.mkdir(frame_goodCoords_save_dirpath)
+                np.save(os.path.join(frame_goodCoords_save_dirpath,
+                                     f"{str(frame_i).zfill(sr_params['padding'])}_GC.npy"),
+                        frame_goodCoords_t.cpu().numpy())
 
             ts = time.time()
-            with torch.no_grad():
-                for i in range(0, n_batches + 1):
-                    i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
-                    if i_s < n_patches:
-                        X_batch = torch.from_numpy(Xin_x4[i_s:i_f].astype(np.float32)).to(torch_devs)
-                        SRx4_pred_batch = x4mod.forward(X_batch).detach().cpu().numpy()
-                        if i == 0: SRx4_pred = deepcopy(SRx4_pred_batch)
-                        else: SRx4_pred = np.append(SRx4_pred, SRx4_pred_batch, axis=0)
-            tf = time.time()
-            t_run += tf - ts
-            SRlogger.info(f"{'-'*5} Time to predict SRx4: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+            labels_t, _ = gpu_ccl(frame_goodCoords_t > 0)
+            patches_exp_t, patches_Y00_t, patches_Z00_t, nr_pixels_t = \
+                extract_patches_gpu(frame_goodCoords_t, labels_t, sr_config)
+            torch.cuda.synchronize()
+            n_patches = int(patches_exp_t.shape[0])
+            tf = time.time(); t_run += tf - ts
+            SRlogger.info(f"\t| Nr. patches in frame {frame_i}: {n_patches}")
+            SRlogger.info(f"{'-'*5} Time to extract patches [GPU]: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
-        if srfac > 4.5:
-            ts = time.time()
-            upscale_fac = 2
-            patches_subset = SRx4_pred[:, x8mod_ch, :, :]
-            upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
-            upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
-            max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
-            max_vals = np.where(max_vals == 0, 1, max_vals)
-            Xin_x8 = upscaled_patches / max_vals
-            tf = time.time()
-            t_run += tf - ts
+            if n_patches == 0:
+                SRlogger.info(f"\t| No patches found in frame {frame_i}")
+                df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
+                continue
 
-            ts = time.time()
-            if torch_devs.type == "cuda":
-                with torch.no_grad(), autocast(torch_devs.type):
-                    for i in range(0, n_batches + 1):
-                        i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
-                        if i_s < n_patches:
-                            X_batch = torch.from_numpy(Xin_x8[i_s:i_f].astype(np.float32)).to(torch_devs)
-                            SRx8_pred_batch = x8mod.forward(X_batch)
-                            current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))
-                            batch_target_sums = patches_Isum[i_s:i_f]
-                            target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
-                            scaling_factors = (target_sums / current_sums).view(-1, 1, 1, 1)
-                            SRx8_pred_batch = (SRx8_pred_batch * scaling_factors).detach().cpu().numpy()
-                            if i == 0: SRx8_pred = deepcopy(SRx8_pred_batch)
-                            else: SRx8_pred = np.append(SRx8_pred, SRx8_pred_batch, axis=0)
+            patches_Isum_t = patches_exp_t.sum(dim=(1, 2, 3))
+
+            orig_frame_index = frame_i + sr_params["SkipFrame"]
+            if sr_params["omegaCenter"] is not None and orig_frame_index < len(sr_params["omegaCenter"]):
+                omega = float(sr_params["omegaCenter"][orig_frame_index])
             else:
-                with torch.no_grad():
-                    for i in range(0, n_batches + 1):
-                        i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
-                        if i_s < n_patches:
-                            X_batch = torch.from_numpy(Xin_x8[i_s:i_f].astype(np.float32)).to(torch_devs)
-                            SRx8_pred_batch = x8mod.forward(X_batch)
-                            current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))
-                            batch_target_sums = patches_Isum[i_s:i_f]
-                            target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
-                            scaling_factors = (target_sums / current_sums).view(-1, 1, 1, 1)
-                            SRx8_pred_batch = (SRx8_pred_batch * scaling_factors).detach().cpu().numpy()
-                            if i == 0: SRx8_pred = deepcopy(SRx8_pred_batch)
-                            else: SRx8_pred = np.append(SRx8_pred, SRx8_pred_batch, axis=0)
-            tf = time.time()
-            t_run += tf - ts
-            SRlogger.info(f"{'-'*5} Time to predict SRx8: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-        if srfac == 2: patches_to_fit = SRx2_pred
-        if srfac == 4: patches_to_fit = SRx4_pred
-        if srfac == 8: patches_to_fit = SRx8_pred
-
-        if saveSRpatches == 1:
-            SR_patch_save_dirpath = f"{midasZarrDir}SR_out{SEP}SR_patches{SEP}"
-            if not os.path.isdir(SR_patch_save_dirpath):
-                os.mkdir(SR_patch_save_dirpath)
+                omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
 
             ts = time.time()
-            np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx1_exp.npy", patches_exp)
-            np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx2_pred.npy", SRx2_pred)
-            if srfac > 2.5:
-                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx4_pred.npy", SRx4_pred)
-            if srfac > 4.5:
-                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx8_pred.npy", SRx8_pred)
-            tf = time.time()
-            t_run += tf - ts
+            SRx_pred_t = cascade_sr_gpu(patches_exp_t, patches_Isum_t,
+                                        x2mod_gpu, x4mod_gpu, x8mod_gpu,
+                                        x2mod_ch, x4mod_ch, x8mod_ch,
+                                        srfac, sr_config["batch_size"], torch_devs)
+            torch.cuda.synchronize()
+            tf = time.time(); t_run += tf - ts
+            SRlogger.info(f"{'-'*5} Time to predict SR cascade [GPU]: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
-        ts = time.time()
-        spotID = int(0)
-        orig_frame_index = frame_i + sr_params["SkipFrame"]
-        if sr_params["omegaCenter"] is not None and orig_frame_index < len(sr_params["omegaCenter"]):
-            omega = float(sr_params["omegaCenter"][orig_frame_index])
-        else:
-            omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
+            if saveSRpatches == 1:
+                SR_patch_save_dirpath = f"{midasZarrDir}SR_out{SEP}SR_patches{SEP}"
+                if not os.path.isdir(SR_patch_save_dirpath):
+                    os.mkdir(SR_patch_save_dirpath)
+                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx1_exp.npy",
+                        patches_exp_t.cpu().numpy())
+                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx{srfac}_pred.npy",
+                        SRx_pred_t.cpu().numpy())
 
-        R_patches = np.sqrt(
-            (sr_params["Ypx_BC"] - (np.array(patches_Y00) + sr_config["spot_find_args"]["patch_size"] / 2))**2 +
-            (sr_params["Zpx_BC"] - (np.array(patches_Z00) + sr_config["spot_find_args"]["patch_size"] / 2))**2
-        )
-
-        if gpu_peakfit_enabled:
-            # ── GPU path: batched pseudo-Voigt fitting on all patches at once ──
-            SRlogger.info(f"\t| GPU peak fitting: {n_patches} patches")
+            ts = time.time()
             df_rows, n_peaks_in_patches_list, spotID = gpu_fit_frame_patches(
-                patches_to_fit, patches_Y00, patches_Z00,
-                patches_exp, nr_pixels_in_patch,
-                patches_Isum,
+                SRx_pred_t, patches_Y00_t, patches_Z00_t,
+                patches_exp_t, nr_pixels_t, patches_Isum_t,
                 sr_params, sr_config, srfac,
-                omega, shiftYpx, shiftZpx,
-                torch_devs)
+                omega, shiftYpx, shiftZpx, torch_devs)
+            torch.cuda.synchronize()
+            tf = time.time(); t_run += tf - ts
+            SRlogger.info(f"{'-'*5} Time to fit peaks [GPU] (frame {frame_i}): {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+
             for row in df_rows:
                 df_peaks_frame_i.loc[len(df_peaks_frame_i)] = row
 
-            # Collect per-peak pixel coordinates for binary output
-            for patch_i in range(len(patches_to_fit)):
-                nz = np.nonzero(patches_exp[patch_i, 0])
+            # D2H once for binary accumulation and patches_info CSV.
+            patches_exp_np = patches_exp_t.cpu().numpy()
+            patches_Y00 = patches_Y00_t.cpu().numpy().tolist()
+            patches_Z00 = patches_Z00_t.cpu().numpy().tolist()
+            nr_pixels_in_patch = nr_pixels_t.cpu().numpy().tolist()
+            patches_Isum = patches_Isum_t.cpu().numpy().tolist()
+            for patch_i in range(n_patches):
+                nz = np.nonzero(patches_exp_np[patch_i, 0])
                 pixel_y = (patches_Z00[patch_i] + nz[0]).astype(np.int16)
                 pixel_z = (patches_Y00[patch_i] + nz[1]).astype(np.int16)
                 n_pk = n_peaks_in_patches_list[patch_i] if patch_i < len(n_peaks_in_patches_list) else 0
@@ -605,73 +504,262 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                     frame_pixels.append((pixel_y, pixel_z))
 
         else:
-            # ── CPU path: original per-patch fitting (COM or PV based on config) ──
+            frame_arr = exData[frame_i].astype(np.float64)
+    
+            # Apply image transformations in sequence (matching MIDAS applyImageTransformations_d)
+            for opt in sr_params["ImTransOpt"]:
+                if opt == 1:
+                    frame_arr = np.flip(frame_arr, axis=1)
+                elif opt == 2:
+                    frame_arr = np.flip(frame_arr, axis=0)
+                elif opt == 3:
+                    frame_arr = np.transpose(frame_arr)
+    
+            # Apply dark/flood/bc corrections (matching MIDAS lines 1430-1440)
+            frame_arr = (frame_arr - dark) / flood
+            frame_arr *= sr_params["bc"]
+    
+            # Zero bad pixels
+            if sr_params["BadPxIntensity"] != 0:
+                frame_arr[frame_arr == sr_params["BadPxIntensity"]] = 0
+    
+            # Apply mask (zero out masked pixels)
+            frame_arr[mask > 0] = 0
+    
+            ts = time.time()
+            frame_goodCoords = np.zeros_like(frame_arr)
+            for ring_i, ring_thresh in enumerate(sr_params["ringsThresh"]):
+                valid_pixels_mask = (RingNrmap == ring_i) & (frame_arr >= ring_thresh)
+                frame_goodCoords[valid_pixels_mask] = frame_arr[valid_pixels_mask]
+    
+            if saveFrameGoodCoords == 1:
+                frame_goodCoords_save_dirpath = os.path.join(midasZarrDir, "SR_out", "frame_goodCoords")
+                if not os.path.isdir(frame_goodCoords_save_dirpath):
+                    os.mkdir(frame_goodCoords_save_dirpath)
+                frame_goodCoords_savepath = os.path.join(frame_goodCoords_save_dirpath,
+                                                          f"{str(frame_i).zfill(sr_params['padding'])}_GC.npy")
+                np.save(frame_goodCoords_savepath, frame_goodCoords)
+    
+            tf = time.time()
+            t_run += tf - ts
+            SRlogger.info(f"{'-'*5} Time to create goodCoords map: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            ts = time.time()
+            patches_exp, patches_Z00, patches_Y00, nr_pixels_in_patch = \
+                patches_from_detector_frame(frame_goodCoords, sr_config, connectivity_dim=8)
+    
+            n_patches = len(patches_exp)
+    
+            if n_patches == 0:
+                SRlogger.info(f"\t| No patches found in frame {frame_i}")
+                df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
+                continue
+    
+            patches_exp = np.expand_dims(patches_exp, axis=1)
+            patches_Isum = np.sum(patches_exp, axis=(1, 2, 3)).tolist()
+    
+            tf = time.time()
+            t_run += tf - ts
+            SRlogger.info(f"\t| Nr. patches in frame {frame_i}: {n_patches}")
+            SRlogger.info(f"{'-'*5} Time to extract patches: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            # SRx2 model
+            ts = time.time()
+            upscale_fac = 2
+            patches_subset = patches_exp[:, x2mod_ch, :, :]
+            upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
+            upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
+            max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
+            max_vals = np.where(max_vals == 0, 1, max_vals)
+            Xin_x2 = upscaled_patches / max_vals
+            tf = time.time()
+            t_run += tf - ts
+    
+            ts = time.time()
+            n_batches = n_patches // sr_config["batch_size"]
+            with torch.no_grad():
+                for i in range(0, n_batches + 1):
+                    i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
+                    if i_s < n_patches:
+                        X_batch = torch.from_numpy(Xin_x2[i_s:i_f].astype(np.float32)).to(torch_devs)
+                        SRx2_pred_batch = x2mod.forward(X_batch).detach().cpu().numpy()
+                        if i == 0: SRx2_pred = deepcopy(SRx2_pred_batch)
+                        else: SRx2_pred = np.append(SRx2_pred, SRx2_pred_batch, axis=0)
+            tf = time.time()
+            t_run += tf - ts
+            SRlogger.info(f"{'-'*5} Time to predict SRx2: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            if srfac > 2.5:
+                ts = time.time()
+                upscale_fac = 2
+                patches_subset = SRx2_pred[:, x4mod_ch, :, :]
+                upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
+                upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
+                max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
+                max_vals = np.where(max_vals == 0, 1, max_vals)
+                Xin_x4 = upscaled_patches / max_vals
+                tf = time.time()
+                t_run += tf - ts
+    
+                ts = time.time()
+                with torch.no_grad():
+                    for i in range(0, n_batches + 1):
+                        i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
+                        if i_s < n_patches:
+                            X_batch = torch.from_numpy(Xin_x4[i_s:i_f].astype(np.float32)).to(torch_devs)
+                            SRx4_pred_batch = x4mod.forward(X_batch).detach().cpu().numpy()
+                            if i == 0: SRx4_pred = deepcopy(SRx4_pred_batch)
+                            else: SRx4_pred = np.append(SRx4_pred, SRx4_pred_batch, axis=0)
+                tf = time.time()
+                t_run += tf - ts
+                SRlogger.info(f"{'-'*5} Time to predict SRx4: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            if srfac > 4.5:
+                ts = time.time()
+                upscale_fac = 2
+                patches_subset = SRx4_pred[:, x8mod_ch, :, :]
+                upscaled_patches = np.repeat(np.repeat(patches_subset, upscale_fac, axis=2), upscale_fac, axis=3)
+                upscaled_patches = upscaled_patches / (upscale_fac * upscale_fac)
+                max_vals = np.max(upscaled_patches, axis=(2, 3), keepdims=True)
+                max_vals = np.where(max_vals == 0, 1, max_vals)
+                Xin_x8 = upscaled_patches / max_vals
+                tf = time.time()
+                t_run += tf - ts
+    
+                ts = time.time()
+                if torch_devs.type == "cuda":
+                    with torch.no_grad(), autocast(torch_devs.type):
+                        for i in range(0, n_batches + 1):
+                            i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
+                            if i_s < n_patches:
+                                X_batch = torch.from_numpy(Xin_x8[i_s:i_f].astype(np.float32)).to(torch_devs)
+                                SRx8_pred_batch = x8mod.forward(X_batch)
+                                current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))
+                                batch_target_sums = patches_Isum[i_s:i_f]
+                                target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
+                                scaling_factors = (target_sums / current_sums).view(-1, 1, 1, 1)
+                                SRx8_pred_batch = (SRx8_pred_batch * scaling_factors).detach().cpu().numpy()
+                                if i == 0: SRx8_pred = deepcopy(SRx8_pred_batch)
+                                else: SRx8_pred = np.append(SRx8_pred, SRx8_pred_batch, axis=0)
+                else:
+                    with torch.no_grad():
+                        for i in range(0, n_batches + 1):
+                            i_s, i_f = i * sr_config["batch_size"], min((i + 1) * sr_config["batch_size"], n_patches)
+                            if i_s < n_patches:
+                                X_batch = torch.from_numpy(Xin_x8[i_s:i_f].astype(np.float32)).to(torch_devs)
+                                SRx8_pred_batch = x8mod.forward(X_batch)
+                                current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))
+                                batch_target_sums = patches_Isum[i_s:i_f]
+                                target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
+                                scaling_factors = (target_sums / current_sums).view(-1, 1, 1, 1)
+                                SRx8_pred_batch = (SRx8_pred_batch * scaling_factors).detach().cpu().numpy()
+                                if i == 0: SRx8_pred = deepcopy(SRx8_pred_batch)
+                                else: SRx8_pred = np.append(SRx8_pred, SRx8_pred_batch, axis=0)
+                tf = time.time()
+                t_run += tf - ts
+                SRlogger.info(f"{'-'*5} Time to predict SRx8: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            if srfac == 2: patches_to_fit = SRx2_pred
+            if srfac == 4: patches_to_fit = SRx4_pred
+            if srfac == 8: patches_to_fit = SRx8_pred
+    
+            if saveSRpatches == 1:
+                SR_patch_save_dirpath = f"{midasZarrDir}SR_out{SEP}SR_patches{SEP}"
+                if not os.path.isdir(SR_patch_save_dirpath):
+                    os.mkdir(SR_patch_save_dirpath)
+    
+                ts = time.time()
+                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx1_exp.npy", patches_exp)
+                np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx2_pred.npy", SRx2_pred)
+                if srfac > 2.5:
+                    np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx4_pred.npy", SRx4_pred)
+                if srfac > 4.5:
+                    np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params['padding'])}_SRx8_pred.npy", SRx8_pred)
+                tf = time.time()
+                t_run += tf - ts
+    
+            ts = time.time()
+            spotID = int(0)
+            orig_frame_index = frame_i + sr_params["SkipFrame"]
+            if sr_params["omegaCenter"] is not None and orig_frame_index < len(sr_params["omegaCenter"]):
+                omega = float(sr_params["omegaCenter"][orig_frame_index])
+            else:
+                omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
+    
+            R_patches = np.sqrt(
+                (sr_params["Ypx_BC"] - (np.array(patches_Y00) + sr_config["spot_find_args"]["patch_size"] / 2))**2 +
+                (sr_params["Zpx_BC"] - (np.array(patches_Z00) + sr_config["spot_find_args"]["patch_size"] / 2))**2
+            )
+    
+            # CPU path: per-patch fitting (CoM or PV based on `fitPeakShapePV`).
+            # The GPU pipeline (when active) bypasses this whole branch — see the
+            # `gpu_pipeline_enabled` block above.
             n_peaks_in_patches_list = []
             for patch_i in range(len(patches_to_fit)):
                 patch = patches_to_fit[patch_i, 0]
                 Z00, Y00 = patches_Z00[patch_i], patches_Y00[patch_i]
-
+    
                 patch_for_locmax = gaussian_filter(patch, sigma=sr_config["peak_find_args"]["gauss_filter_sigma"][f"SRx{srfac}"])
                 patch_for_locmax = median_filter(patch_for_locmax, size=sr_config["peak_find_args"]["median_filter_size"][f"SRx{srfac}"])
-
+    
                 locmax_peak_coords = peak_local_max(patch_for_locmax,
                                                     min_distance=sr_config["peak_find_args"]["min_d"][f"SRx{srfac}"],
                                                     threshold_rel=sr_config["peak_find_args"]["thresh_rel"][f"SRx{srfac}"])
-
+    
                 n_peaks_in_patch = len(locmax_peak_coords)
                 n_peaks_in_patches_list.append(n_peaks_in_patch)
-
+    
                 if (str(sr_config["fitPeakShapePV"]).lower() in ["no", "n", "false", "f", "0"]) or \
                    (str(sr_config["fitPeakShapePV"]).lower() in ["auto", "partial", "mix"] and n_peaks_in_patch == 1):
-
+    
                     bnd_peak_cutoff = sr_config["edge_bound_cutoff_fac"] * srfac
                     locmax_peak_coords = locmax_peak_coords[~(locmax_peak_coords[:, :] < bnd_peak_cutoff).any(1)]
                     locmax_peak_coords = locmax_peak_coords[~(locmax_peak_coords[:, :] > ((sr_config["lrsz"] * srfac) - bnd_peak_cutoff)).any(1)]
-
+    
                     com_coords = com_peak_coords(patch, locmax_peak_coords,
                                                  threshold=0.7,
                                                  peak_crop_size=sr_config["peak_find_args"]["peak_crop_size"][f"SRx{srfac}"])
-
+    
                     labelled_patch, peak_label_values, peaks_Isum, peaks_NrPixels = \
                         watershed_peaks(patch, locmax_peak_coords,
                                         mask_thresh=sr_config["peak_find_args"]["thresh_rel"][f"SRx{srfac}"])
-
+    
                     n_peaks_in_patch_after_ws = len(com_coords)
                     for (peak_i_inner, peak_label) in zip(range(n_peaks_in_patch_after_ws), peak_label_values):
                         spotID += 1
-
+    
                         peak_i_patch = patch * (labelled_patch == peak_label)
-
+    
                         downscale_fac = int(srfac / 1)
                         h, w = peak_i_patch.shape
                         new_h, new_w = h // downscale_fac, w // downscale_fac
                         reshaped = peak_i_patch[:new_h * downscale_fac, :new_w * downscale_fac].reshape(
                             new_h, downscale_fac, new_w, downscale_fac)
                         peak_i_patch_SRx1 = np.sum(reshaped, axis=(1, 3))
-
+    
                         IntegratedIntensity = np.sum(peak_i_patch_SRx1)
                         NrPixels = np.count_nonzero(peak_i_patch_SRx1 > 1E-2)
                         IMax = np.max(peak_i_patch_SRx1)
                         TotalNrPixelsInPeakRegion = nr_pixels_in_patch[patch_i]
-
+    
                         YCen_px = Y00 + (com_coords[peak_i_inner][1] * (1 / srfac)) + float(shiftYpx)
                         ZCen_px = Z00 + (com_coords[peak_i_inner][0] * (1 / srfac)) + float(shiftZpx)
-
+    
                         R = math.sqrt((sr_params["Ypx_BC"] - YCen_px)**2 + (sr_params["Zpx_BC"] - ZCen_px)**2)
                         Eta = math.degrees(math.acos((ZCen_px - sr_params["Zpx_BC"]) / R))
                         Eta = Eta * ((YCen_px - sr_params["Ypx_BC"]) / np.abs(YCen_px - sr_params["Ypx_BC"]))
-
+    
                         SigmaR, SigmaEta = 1, 1
-
+    
                         r_max_SRx1, c_max_SRx1 = np.unravel_index(np.argmax(peak_i_patch_SRx1), peak_i_patch_SRx1.shape)
                         maxY = Y00 + c_max_SRx1
                         maxZ = Z00 + r_max_SRx1
                         diffY = maxY - YCen_px
                         diffZ = maxZ - ZCen_px
-
+    
                         rawIMax = float(np.max(patches_exp[patch_i, 0]))
                         RawSumIntensity = float(patches_Isum[patch_i])
-
+    
                         peak_data = [spotID, IntegratedIntensity, omega, YCen_px, ZCen_px, IMax, R, Eta,
                                      SigmaR, SigmaEta, NrPixels, TotalNrPixelsInPeakRegion,
                                      n_peaks_in_patch, maxY, maxZ, diffY, diffZ,
@@ -679,16 +767,16 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                                      1.0, 0.0, 1.0, 0.0,
                                      0.0, RawSumIntensity, 0.0, 0.0]
                         df_peaks_frame_i.loc[spotID - 1] = peak_data
-
+    
                         # Collect pixel coords for binary output
                         nz = np.nonzero(patches_exp[patch_i, 0])
                         pixel_y = (Z00 + nz[0]).astype(np.int16)
                         pixel_z = (Y00 + nz[1]).astype(np.int16)
                         frame_pixels.append((pixel_y, pixel_z))
-
+    
                 if (str(sr_config["fitPeakShapePV"]).lower() in ["yes", "y", "true", "t", "1"]) or \
                    (str(sr_config["fitPeakShapePV"]).lower() in ["auto", "partial", "mix"] and n_peaks_in_patch >= 2):
-
+    
                     try:
                         pvfit_peaks, _, fit_patch = multi_pv_fit(patch, patches_Y00[patch_i], patches_Z00[patch_i],
                                                           sr_params["Ypx_BC"], sr_params["Zpx_BC"],
@@ -698,39 +786,39 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                                                           gauss_filter_sigma=sr_config["peak_find_args"]["gauss_filter_sigma"][f"SRx{srfac}"],
                                                           median_filter_size=sr_config["peak_find_args"]["median_filter_size"][f"SRx{srfac}"],
                                                           lr_int_thresh=sr_config["peak_find_args"]["pvfit_int_thresh"][f"SRx{srfac}"])
-
+    
                         n_peaks_in_patch = len(pvfit_peaks)
                         for peak_i_inner in range(n_peaks_in_patch):
                             spotID += 1
                             peak_prop = pvfit_peaks[peak_i_inner]
                             R, Eta = peak_prop["R(px)"], peak_prop["Eta(deg)"]
-
+    
                             dpx_sr = 1 / srfac
                             Ypx = np.arange(Y00, Y00 + sr_config["spot_find_args"]["patch_size"], dpx_sr)
                             Zpx = np.arange(Z00, Z00 + sr_config["spot_find_args"]["patch_size"], dpx_sr)
-
+    
                             grid_YY, grid_ZZ = np.meshgrid(Ypx, Zpx)
                             grid_RR = ((sr_params["Ypx_BC"] - grid_YY)**2 + (sr_params["Zpx_BC"] - grid_ZZ)**2)**0.5
                             grid_EE = np.rad2deg(np.arccos((grid_ZZ - sr_params["Zpx_BC"]) / grid_RR))
                             grid_EE = grid_EE * ((grid_YY - sr_params["Ypx_BC"]) / np.abs(grid_YY - sr_params["Ypx_BC"]))
-
+    
                             peak_fit_patch = pseudoVoigt2d_diffLGwidth(grid_RR, grid_EE,
                                                                         y0=R, z0=Eta,
                                                                         ySigG=peak_prop["SigGR"], zSigG=peak_prop["SigGEta"],
                                                                         ySigL=peak_prop["SigLR"], zSigL=peak_prop["SigLEta"],
                                                                         LGmix=peak_prop["LGmix"], IMax=peak_prop["IMax"])
-
+    
                             downscale_fac = int(srfac / 1)
                             h, w = peak_fit_patch.shape
                             new_h, new_w = h // downscale_fac, w // downscale_fac
                             reshaped = peak_fit_patch[:new_h * downscale_fac, :new_w * downscale_fac].reshape(
                                 new_h, downscale_fac, new_w, downscale_fac)
                             peak_fit_patch_SRx1 = np.sum(reshaped, axis=(1, 3))
-
+    
                             r_max_SRx1, c_max_SRx1 = np.unravel_index(np.argmax(peak_fit_patch_SRx1), peak_fit_patch_SRx1.shape)
                             maxY = Y00 + c_max_SRx1
                             maxZ = Z00 + r_max_SRx1
-
+    
                             IntegratedIntensity = np.sum(peak_fit_patch)
                             YCen_px = peak_prop["Y(px)"] + shiftYpx
                             ZCen_px = peak_prop["Z(px)"] + shiftZpx
@@ -739,14 +827,14 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                             SigmaEta = max(peak_prop["SigGEta"], peak_prop["SigLEta"])
                             NrPixels = np.count_nonzero(peak_fit_patch_SRx1 * patches_exp[patch_i])
                             TotalNrPixelsInPeakRegion = nr_pixels_in_patch[patch_i]
-
+    
                             diffY = maxY - YCen_px
                             diffZ = maxZ - ZCen_px
-
+    
                             rawIMax = float(np.max(patches_exp[patch_i, 0]))
                             fit_rmse = float(np.sqrt(np.mean((fit_patch - patch) ** 2)))
                             RawSumIntensity = float(patches_Isum[patch_i])
-
+    
                             peak_data = [spotID, IntegratedIntensity, omega, YCen_px, ZCen_px, IMax, R, Eta,
                                          SigmaR, SigmaEta, NrPixels, TotalNrPixelsInPeakRegion,
                                          n_peaks_in_patch, maxY, maxZ, diffY, diffZ,
@@ -755,20 +843,20 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                                          float(peak_prop["SigGEta"]), float(peak_prop["SigLEta"]),
                                          float(peak_prop["LGmix"]), RawSumIntensity, 0.0, fit_rmse]
                             df_peaks_frame_i.loc[spotID - 1] = peak_data
-
+    
                             # Collect pixel coords for binary output
                             nz = np.nonzero(patches_exp[patch_i, 0])
                             pixel_y = (Z00 + nz[0]).astype(np.int16)
                             pixel_z = (Y00 + nz[1]).astype(np.int16)
                             frame_pixels.append((pixel_y, pixel_z))
-
+    
                     except Exception as e:
                         SRlogger.warning(f"\tFrame {frame_i}: Patch {patch_i} skipped (pvfit failed: {e})")
-
-        tf = time.time()
-        t_run += tf - ts
-        fit_method = "GPU" if gpu_peakfit_enabled else "CPU"
-        SRlogger.info(f"{'-'*5} Time to fit peaks [{fit_method}] (frame {frame_i}): {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+    
+            tf = time.time()
+            t_run += tf - ts
+            fit_method = "GPU" if gpu_pipeline_enabled else "CPU"
+            SRlogger.info(f"{'-'*5} Time to fit peaks [{fit_method}] (frame {frame_i}): {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
         df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
 

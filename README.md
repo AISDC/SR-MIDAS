@@ -4,7 +4,9 @@ Super-resolution workflow for [MIDAS](https://github.com/marinerhemant/MIDAS) Fa
 
 SR-MIDAS provides pipelines for - (a) using pre-trained CNN models, and (b) training new super-resolution models - to enhance the spatial resolution of 2D diffraction patches extracted from FF-HEDM datasets. It integrates with the [MIDAS](https://github.com/marinerhemant/MIDAS) FF-HEDM grain reconstruction routine for improved overlapping peak detection and more precise peak localization for FF-HEDM analysis.
 
-**v0.1.2** — GPU-accelerated peak fitting is now available, providing ~1000x speedup over the CPU path by using batched pseudo-Voigt fitting with PyTorch on CUDA GPUs. GPU fitting is enabled by default and falls back to CPU automatically when no CUDA device is available.
+**v0.1.3** — End-to-end all-GPU per-frame pipeline: preprocessing (dark/flood/mask/ring-threshold), connected-component labeling, patch extraction, and the SRx2→4→8 cascade now stay on-device through to peak fitting, eliminating the per-stage CPU round-trips of v0.1.2. The sub-pixel `shiftYpx`/`shiftZpx` correction that maps SR-grid coords to MIDAS pixel-center convention is auto-computed from `srfac` — no `shift_YZ_pos` config entry needed.
+
+**v0.1.2** — Introduced GPU-accelerated peak fitting via batched pseudo-Voigt with `torch.compile` JIT on CUDA, replacing the per-patch `scipy.curve_fit` CPU path and giving ~1000× speedup at the fitting stage. Enabled by default; falls back to CPU automatically when no CUDA device is available.
 
 ---
 
@@ -599,14 +601,11 @@ Four pretrained CNNSR models are bundled with the package:
         "median_filter_size":{"SRx1": 1,  "SRx2": 1,   "SRx4": 1,  "SRx8": 1},
         "peak_crop_size":    {"SRx1": 2,  "SRx2": 8,   "SRx4": 10, "SRx8": 20},
         "pvfit_int_thresh":  {"SRx1": 60, "SRx2": 20,  "SRx4": 15, "SRx8": 10}
-    },
-    "shift_YZ_pos": {
-        "SRx2": {"shiftYpx": -0.25,   "shiftZpx": -0.25},
-        "SRx4": {"shiftYpx": -0.375,  "shiftZpx": -0.375},
-        "SRx8": {"shiftYpx": -0.4375, "shiftZpx": -0.4375}
     }
 }
 ```
+
+> **Sub-pixel shift correction** *(v0.1.3+)*: SR-MIDAS's internal SR grid places the leading edge of native pixel `Y00` at grid position `Y00 + 0`, while MIDAS treats integer pixel index `Y00` as the pixel center. The compensating shift `-(srfac - 1) / (2 * srfac)` (e.g. `-0.4375` at SRx8) is now computed automatically from `srfac` inside `sr_midas.physics.coord_transform.pixel_center_shift_for_srfac` and applied as the last step of fitting — no `shift_YZ_pos` block is needed in the config. Any `shift_YZ_pos` entries left in user configs from v0.1.2 or earlier are ignored.
 
 | Key | Description |
 |---|---|
@@ -618,7 +617,6 @@ Four pretrained CNNSR models are bundled with the package:
 | `R_deviation` | Max deviation (pixels) from the expected ring radius for a valid peak |
 | `spot_find_args` | Intensity threshold and patch size for initial spot detection |
 | `peak_find_args` | Per-SR-level parameters for peak finding (min distance, relative threshold, filter sizes, crop size) |
-| `shift_YZ_pos` | Sub-pixel shift corrections applied to peak positions at each SR level |
 
 ---
 
@@ -648,7 +646,7 @@ All convolutions use same-padding, so spatial dimensions are preserved throughou
 
 ## GPU Peak Fitting
 
-*Added in v0.1.2*
+*Added in v0.1.2 · End-to-end all-GPU pipeline in v0.1.3*
 
 SR-MIDAS includes GPU-accelerated 2D pseudo-Voigt peak fitting as an alternative to the per-patch `scipy.curve_fit` (TRF) CPU path. When enabled, all patches in a detector frame are fitted simultaneously on the GPU using a batched Adam optimizer with `torch.compile` JIT compilation.
 
@@ -658,12 +656,23 @@ SR-MIDAS includes GPU-accelerated 2D pseudo-Voigt peak fitting as an alternative
 2. **Batched pseudo-Voigt fitting** — a differentiable 2D pseudo-Voigt model is evaluated for all patches in parallel, with parameter bounds enforced via sigmoid projection
 3. **torch.compile acceleration** — the fitting kernel is JIT-compiled on first use (one-time warmup cost), providing significant speedup for subsequent frames
 
+### v0.1.3 runtime changes — end-to-end all-GPU per-frame pipeline
+
+In v0.1.2 only the peak-fitting stage ran on GPU; preprocessing, connected-component labeling, patch extraction, and the SR cascade still bounced through CPU/numpy between stages. v0.1.3 keeps each frame on-device from raw read to final fit:
+
+- **`pipeline/_gpu_preprocess.py`** *(new)* — per-frame preprocessing on GPU: image transforms, dark subtraction, flood division, beam-current scaling, bad-pixel zeroing, mask, ring thresholding. Static correction arrays (dark, flood, mask, ring-Nr map) are uploaded once at pipeline startup via `upload_correction_frames` instead of being re-transferred every frame. Also provides `gpu_ccl` — batched connected-component labeling via iterative 3×3 min-pooling — and `extract_patches_gpu`.
+- **`pipeline/_gpu_sr_cascade.py`** *(new)* — cascaded SRx2 → SRx4 → SRx8 CNN inference with no per-stage CPU round-trip. `np.repeat` upsampling is replaced with `torch.repeat_interleave`, per-stage max-normalization runs on device, and the SRx8 intensity rescaling is applied with the patch sums kept as a tensor. Output is handed straight to the GPU peak fitter.
+- **`pipeline/_gpu_peakfit.py`** — extended to consume the cascade output tensor directly. Coordinates that were previously list/numpy at the call site are auto-coerced.
+- **`pipeline/sr_process.py`** — when `use_gpu=1` and CUDA is available, the per-frame path runs `preprocess_frame_gpu → gpu_ccl → extract_patches_gpu → cascade_sr_gpu → gpu_fit_frame_patches` with `torch.cuda.synchronize()` between stages for accurate timing; the legacy CPU path (`use_gpu=0` or no CUDA) is unchanged. The sub-pixel `shiftYpx`/`shiftZpx` correction is now auto-computed from `srfac` (see SR Config File above) instead of read from the config.
+
+Numerics: bit-for-bit identical to the v1 CPU-bouncing cascade aside from floating-point ordering differences inside the CNN (PyTorch is free to pick different reduction orders on GPU vs CPU). With CUDA deterministic mode disabled (the default in `sr_process.py`), small last-decimal differences are expected; YCen/ZCen agree with the MIDAS CPU reference to 5 decimal places on the bundled test frame.
+
 ### Usage
 
 GPU peak fitting is **enabled by default** (`use_gpu=1`). No additional configuration is required — it uses the same `peak_find_args` parameters from the SR config file.
 
 **Behavior:**
-- If `use_gpu=1` and a CUDA GPU is available → GPU peak fitting is used
+- If `use_gpu=1` and a CUDA GPU is available → all-GPU per-frame pipeline is used
 - If `use_gpu=0` → CPU peak fitting is used (original `scipy.curve_fit` path)
 - If no CUDA GPU is available → falls back to CPU with a warning
 
