@@ -403,9 +403,23 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
         nr_frames = min(nr_frames, int(max_frames))
         SRlogger.info(f"\t|max_frames cap active: processing first {nr_frames} frames only")
 
-    shiftYpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftYpx"]
-    shiftZpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftZpx"]
-    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx}")
+    # Sub-pixel correction that maps SR-grid coords to MIDAS pixel-center
+    # convention. SR-MIDAS's _gpu_peakfit.build_RE_grids places the first
+    # SR pixel of each patch at the LEADING EDGE of its native pixel
+    # (offset = arange * 1/srfac, starting at 0), whereas MIDAS treats
+    # integer pixel indices as pixel CENTERS. The shift that brings the
+    # SR output back into MIDAS convention is -(srfac-1)/(2*srfac):
+    #   SRx2: -0.25, SRx4: -0.375, SRx8: -0.4375.
+    # Auto-computed here; a config-level override is honored if present
+    # (look up sr_config['shift_YZ_pos'][f'SRx{srfac}'].{shiftYpx,shiftZpx}).
+    _default_shift = -(srfac - 1) / (2.0 * srfac)
+    _shift_cfg = sr_config.get("shift_YZ_pos", {}).get(f"SRx{srfac}", {})
+    shiftYpx = float(_shift_cfg.get("shiftYpx", _default_shift))
+    shiftZpx = float(_shift_cfg.get("shiftZpx", _default_shift))
+    _shift_source = "config override" if (
+        "shiftYpx" in _shift_cfg or "shiftZpx" in _shift_cfg
+    ) else "auto -(srfac-1)/(2*srfac)"
+    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx}  ({_shift_source})")
 
     # Resolve the peak-fit routine for the all-GPU branch. The MIDAS-style
     # routine ports PeaksFittingOMPZarrRefactor.c::fit2DPeaks methodology

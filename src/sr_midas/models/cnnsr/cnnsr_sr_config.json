@@ -58,21 +58,5 @@
             "about": "intensity threshold used for pseudo-Voigt fitting"
         }
     },
-    "shift_YZ_pos": {
-        "SRx2": {
-            "shiftYpx": -0.25,
-            "shiftZpx": -0.25,
-            "about": "sub-pixel shift corrections in Y and Z for SRx2 peak positions"
-        },
-        "SRx4": {
-            "shiftYpx": -0.375,
-            "shiftZpx": -0.375,
-            "about": "sub-pixel shift corrections in Y and Z for SRx4 peak positions"
-        },
-        "SRx8": {
-            "shiftYpx": -0.4375,
-            "shiftZpx": -0.4375,
-            "about": "sub-pixel shift corrections in Y and Z for SRx8 peak positions"
-        }
-    }
+    "_shift_YZ_pos_about": "Sub-pixel shift corrections that map SR-grid coords to MIDAS pixel-center convention are auto-computed in sr_process.py as -(srfac-1)/(2*srfac) (= -0.25 for SRx2, -0.375 for SRx4, -0.4375 for SRx8). To override, add a 'shift_YZ_pos' block with the same shape as before (per-srfac shiftYpx / shiftZpx)."
 }
