@@ -7,6 +7,8 @@
     "lrsz": 20,
     "edge_bound_cutoff_fac": 2.5,
     "batch_size": 400,
+    "peak_fit_method": "gpu_adam",
+    "_peak_fit_method_about": "Which SR-MIDAS peak-fit routine to use in run_sr_process. Options: 'gpu_adam' (default, fast batched-Adam on GPU, no BG term), 'gpu_midas_style' (batched-Adam on GPU with MIDAS-style BG + moment-init + region-dependent bounds + MIDAS IntegratedIntensity/NrPixels rules), 'midas_style' (CPU per-patch Nelder-Mead with BG, very slow; for methodology verification only).",
     "mods_to_use": {
         "SRx2": {
             "mod_dir": "x1_x2-pst60000-240117_arch3-itrOut",
@@ -54,6 +56,23 @@
         "pvfit_int_thresh": {
             "SRx1": 60, "SRx2": 20, "SRx4": 15, "SRx8": 10,
             "about": "intensity threshold used for pseudo-Voigt fitting"
+        }
+    },
+    "shift_YZ_pos": {
+        "SRx2": {
+            "shiftYpx": -0.25,
+            "shiftZpx": -0.25,
+            "about": "sub-pixel shift corrections in Y and Z for SRx2 peak positions"
+        },
+        "SRx4": {
+            "shiftYpx": -0.375,
+            "shiftZpx": -0.375,
+            "about": "sub-pixel shift corrections in Y and Z for SRx4 peak positions"
+        },
+        "SRx8": {
+            "shiftYpx": -0.4375,
+            "shiftZpx": -0.4375,
+            "about": "sub-pixel shift corrections in Y and Z for SRx8 peak positions"
         }
     }
 }

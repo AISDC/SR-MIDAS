@@ -19,6 +19,13 @@ def main():
                         help="Save SR patches (1=yes, 0=no)")
     parser.add_argument("-saveFrameGoodCoords", type=int, default=1,
                         help="Save frame good coordinates (1=yes, 0=no)")
+    parser.add_argument("-maxFrames", type=int, default=0,
+                        help="Cap the number of frames processed (0 = no cap). "
+                             "Useful when running midas_style on real data.")
+    # The peak-fit routine is selected via the `peak_fit_method` field in
+    # the sr_config JSON (bundled cnnsr_sr_config.json or any custom one
+    # passed via -SRconfig). Valid values: 'gpu_adam', 'gpu_midas_style',
+    # 'midas_style'. Edit the JSON to switch.
 
     args = parser.parse_args()
 
@@ -28,6 +35,7 @@ def main():
         SRconfig_path=args.SRconfig,
         saveSRpatches=args.saveSRpatches,
         saveFrameGoodCoords=args.saveFrameGoodCoords,
+        max_frames=(args.maxFrames if args.maxFrames > 0 else None),
     )
 
 

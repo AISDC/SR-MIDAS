@@ -27,7 +27,6 @@ from copy import deepcopy
 
 from sr_midas.utils.io import (NumpyEncoder, setup_logging, read_hkls_csv,
                                 parse_sr_config_txt, update_nested_dict)
-from sr_midas.physics.coord_transform import pixel_center_shift_for_srfac
 from sr_midas.physics.detector import (create_rotation_matrices, create_distortion_map,
                                         ringNr_map_on_detector)
 from sr_midas.physics.peaks2d import pseudoVoigt2d_diffLGwidth
@@ -42,7 +41,8 @@ SEP = os.sep
 
 def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                    saveSRpatches=1, saveFrameGoodCoords=1,
-                   use_gpu=1):
+                   use_gpu=1, peak_fit_method=None,
+                   max_frames=None):
     """Run the MIDAS super-resolution processing pipeline.
 
     Loads a MIDAS zarr zip file, applies cascaded CNN super-resolution to
@@ -58,6 +58,20 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
         saveFrameGoodCoords (int; default=1): 1 to save goodCoords maps, 0 to skip
         use_gpu (int; default=1): 1 to use GPU-accelerated peak fitting when CUDA
             is available, 0 to always use the CPU path
+        peak_fit_method (str or None; default=None): which peak-fit routine to
+            use in the all-GPU pipeline branch. When None (the default), the
+            value is read from `sr_config["peak_fit_method"]` (bundled JSON
+            ships with "gpu_adam"). Pass a string to override per-call.
+            Recognised values:
+              * "gpu_adam"        — fast batched Adam (no BG term)
+              * "gpu_midas_style" — batched Adam on GPU with MIDAS-style BG,
+                                    moment-based init, region-dependent bounds,
+                                    MIDAS IntegratedIntensity/NrPixels rules.
+              * "midas_style"     — CPU per-patch Nelder-Mead with BG (slow;
+                                    methodology verification only).
+        max_frames (int or None; default=None): if set, only the first
+            max_frames are processed -- useful for the MIDAS-style fit
+            method, which is too slow to run on full detector sweeps.
     """
 
     if midasZarrDir[-1] != SEP:
@@ -385,11 +399,45 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                  "MU", "RawSumIntensity", "maskTouched", "FitRMSE"]
 
     nr_frames = exData.shape[0]
+    if max_frames is not None and max_frames > 0:
+        nr_frames = min(nr_frames, int(max_frames))
+        SRlogger.info(f"\t|max_frames cap active: processing first {nr_frames} frames only")
 
-    # Auto-derived from srfac: maps internal SR-grid (leading-edge) coords to
-    # MIDAS pixel-center convention. See physics.coord_transform.
-    shiftYpx = shiftZpx = pixel_center_shift_for_srfac(srfac)
-    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx} (auto from srfac={srfac})")
+    shiftYpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftYpx"]
+    shiftZpx = sr_config["shift_YZ_pos"][f"SRx{srfac}"]["shiftZpx"]
+    SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx}")
+
+    # Resolve the peak-fit routine for the all-GPU branch. The MIDAS-style
+    # routine ports PeaksFittingOMPZarrRefactor.c::fit2DPeaks methodology
+    # (per-region BG, moment-based widths, region-dependent bounds,
+    # Nelder-Mead) onto the SR-predicted patches; the default Adam routine
+    # remains the production fitter.
+    # Resolve which peak-fit routine to use. Priority:
+    #   1. explicit kwarg (peak_fit_method != None) — for direct Python callers
+    #   2. sr_config["peak_fit_method"] — the canonical source when invoked
+    #      from ff_MIDAS / sr-midas-process (sr_config is loaded above from
+    #      either SRconfig_path or the bundled cnnsr_sr_config.json)
+    #   3. fallback to "gpu_adam"
+    if peak_fit_method is None:
+        peak_fit_method = str(sr_config.get("peak_fit_method", "gpu_adam"))
+    SRlogger.info(f"\t|peak_fit_method (resolved): {peak_fit_method}")
+
+    peak_fit_fn = None
+    if peak_fit_method == "midas_style":
+        from sr_midas.pipeline._peakfit_midas_style import midas_style_fit_frame_patches
+        peak_fit_fn = midas_style_fit_frame_patches
+        SRlogger.info(f"\t|peak_fit_method: midas_style (CPU per-patch Nelder-Mead with BG)")
+    elif peak_fit_method == "gpu_midas_style":
+        from sr_midas.pipeline._gpu_peakfit_midas_style import gpu_midas_fit_frame_patches
+        peak_fit_fn = gpu_midas_fit_frame_patches
+        SRlogger.info(f"\t|peak_fit_method: gpu_midas_style (batched-Adam on GPU with BG + MIDAS init/bounds/rules)")
+    elif peak_fit_method == "gpu_adam":
+        SRlogger.info(f"\t|peak_fit_method: gpu_adam (default batched-Adam, BG=0)")
+    else:
+        SRlogger.warning(
+            f"\t|peak_fit_method: unknown value '{peak_fit_method}' -- "
+            f"falling back to gpu_adam. Valid: gpu_adam, gpu_midas_style, midas_style."
+        )
 
     # Accumulators for consolidated binary output
     all_frame_peak_data = [None] * nr_frames   # for AllPeaks_PS.bin
@@ -477,14 +525,25 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
                         SRx_pred_t.cpu().numpy())
 
             ts = time.time()
-            df_rows, n_peaks_in_patches_list, spotID = gpu_fit_frame_patches(
-                SRx_pred_t, patches_Y00_t, patches_Z00_t,
-                patches_exp_t, nr_pixels_t, patches_Isum_t,
-                sr_params, sr_config, srfac,
-                omega, shiftYpx, shiftZpx, torch_devs)
-            torch.cuda.synchronize()
+            if peak_fit_fn is None:
+                df_rows, n_peaks_in_patches_list, spotID = gpu_fit_frame_patches(
+                    SRx_pred_t, patches_Y00_t, patches_Z00_t,
+                    patches_exp_t, nr_pixels_t, patches_Isum_t,
+                    sr_params, sr_config, srfac,
+                    omega, shiftYpx, shiftZpx, torch_devs)
+                torch.cuda.synchronize()
+                fit_label = "GPU-Adam"
+            else:
+                # MIDAS-style fitter runs on CPU per patch; no cuda sync needed
+                df_rows, n_peaks_in_patches_list, spotID = peak_fit_fn(
+                    SRx_pred_t, patches_Y00_t, patches_Z00_t,
+                    patches_exp_t, nr_pixels_t, patches_Isum_t,
+                    sr_params, sr_config, srfac,
+                    omega, shiftYpx, shiftZpx, torch_devs,
+                    logger=SRlogger)
+                fit_label = "MIDAS-style-CPU"
             tf = time.time(); t_run += tf - ts
-            SRlogger.info(f"{'-'*5} Time to fit peaks [GPU] (frame {frame_i}): {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+            SRlogger.info(f"{'-'*5} Time to fit peaks [{fit_label}] (frame {frame_i}): {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
             for row in df_rows:
                 df_peaks_frame_i.loc[len(df_peaks_frame_i)] = row

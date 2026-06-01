@@ -73,25 +73,3 @@ def beamcenter_from_YZREta(Ypx, Zpx, R_inPx, Eta_inDeg):
     Zpx_BC = Zpx - (R_inPx * np.cos(np.deg2rad(Eta_inDeg)))
 
     return (Ypx_BC, Zpx_BC)
-
-
-# ----------------------------
-def pixel_center_shift_for_srfac(srfac):
-    """Sub-pixel offset that maps SR-MIDAS internal pixel coordinates to the MIDAS pixel-center convention.
-
-    SR-MIDAS's internal SR grid (built in `_gpu_peakfit.build_RE_grids` and
-    the CPU equivalent) places the leading edge of native pixel `Y00` at
-    grid position `Y00 + 0`. MIDAS (FF_HEDM PeaksFittingOMPZarrRefactor.c)
-    treats integer pixel index `Y00` as the pixel center. Adding this
-    shift to YCen/ZCen at the end of fitting brings SR-MIDAS output into
-    MIDAS convention.
-
-    Args:
-        srfac (int): super-resolution factor (1, 2, 4, 8, ...).
-    Returns:
-        float: shift in pixels to add to fitted YCen and ZCen. Zero for
-            srfac == 1 (no SR grid), negative otherwise.
-    """
-    if srfac <= 1:
-        return 0.0
-    return -(srfac - 1) / (2.0 * srfac)
