@@ -4,9 +4,27 @@ Super-resolution workflow for [MIDAS](https://github.com/marinerhemant/MIDAS) Fa
 
 SR-MIDAS provides pipelines for - (a) using pre-trained CNN models, and (b) training new super-resolution models - to enhance the spatial resolution of 2D diffraction patches extracted from FF-HEDM datasets. It integrates with the [MIDAS](https://github.com/marinerhemant/MIDAS) FF-HEDM grain reconstruction routine for improved overlapping peak detection and more precise peak localization for FF-HEDM analysis.
 
-**v0.1.3** — End-to-end all-GPU per-frame pipeline: preprocessing (dark/flood/mask/ring-threshold), connected-component labeling, patch extraction, and the SRx2→4→8 cascade now stay on-device through to peak fitting, eliminating the per-stage CPU round-trips of v0.1.2. The sub-pixel `shiftYpx`/`shiftZpx` correction that maps SR-grid coords to MIDAS pixel-center convention is auto-computed from `srfac` — no `shift_YZ_pos` config entry needed.
-
-**v0.1.2** — Introduced GPU-accelerated peak fitting via batched pseudo-Voigt with `torch.compile` JIT on CUDA, replacing the per-patch `scipy.curve_fit` CPU path and giving ~1000× speedup at the fitting stage. Enabled by default; falls back to CPU automatically when no CUDA device is available.
+**v0.2** —End-to-end GPU pipeline + MIDAS-methodology peak fitting. 
+  * End-to-end all-GPU per-frame pipeline: preprocessing
+    (dark/flood/mask/ring-threshold), connected-component labeling,
+    patch extraction, the SRx2 -> 4 -> 8 cascade, and peak fitting all
+    stay on-device, eliminating the per-stage CPU round-trips of 0.1.2.
+  * New `gpu_midas_style` peak-fit routine: batched-Adam on GPU with
+    MIDAS-style background fitting, moment-based per-peak sigma init,
+    region-dependent bounds, and MIDAS IntegratedIntensity / NrPixels
+    rules. torch.compile-fused step body delivers gpu_adam-class
+    steady-state throughput (~0.3 ms/patch).
+  * New `midas_style` peak-fit routine (CPU Nelder-Mead with BG) for
+    methodology verification.
+  * Peak-fit routine is now selected via `peak_fit_method` in the
+    sr_config JSON (default "gpu_adam"); no CLI flag duplication.
+  * Sub-pixel SR-to-MIDAS shift correction is now auto-computed in
+    sr_process.py as -(srfac-1)/(2*srfac); the `shift_YZ_pos` block is
+    no longer required in sr_config (still honored as an override).
+  * Cascade autocast extended to all three stages (SRx2 + SRx4 + SRx8)
+    and torch.compile applied to the cascade CNNs in the GPU pipeline,
+    giving ~1.33x cascade-stage speedup on top of the prior fp16-on-SRx8
+    baseline.
 
 ---
 
